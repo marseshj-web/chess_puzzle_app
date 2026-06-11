@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
-import { Lightbulb, Eye, ChevronLeft, ChevronRight, Trophy, X, Loader2, ArrowLeft } from "lucide-react";
+import { Lightbulb, Eye, ChevronLeft, ChevronRight, Trophy, X, Loader2, ArrowLeft, Activity } from "lucide-react";
+import * as engine from "./engine";
 
 /* ─────────────────────────────────────────────────────────────
    Chess engine (self-contained, no external lib)
@@ -30,6 +31,21 @@ function parseFEN(fen: string): Pos {
     }
   }
   return { board, turn, castling: castling || "-", ep: ep && ep !== "-" ? ep : null };
+}
+
+function posToFEN(pos: Pos): string {
+  const rows: string[] = [];
+  for (let rank = 8; rank >= 1; rank--) {
+    let row = "", empty = 0;
+    for (let f = 0; f < 8; f++) {
+      const pc = pos.board[FILES[f] + rank];
+      if (pc) { if (empty) { row += empty; empty = 0; } row += pc; }
+      else empty++;
+    }
+    if (empty) row += empty;
+    rows.push(row);
+  }
+  return `${rows.join("/")} ${pos.turn} ${pos.castling || "-"} ${pos.ep || "-"} 0 1`;
 }
 
 function findKing(board: Record<string, string>, color: string): string | null {
@@ -144,6 +160,30 @@ function displaySquares(pc: string): string[][] {
   return ranks.map(rank=>files.map(f=>f+rank));
 }
 
+/* ── analysis display ── */
+interface NEval { type: "cp" | "mate"; white: number; depth: number; best?: string; }
+
+function sqCenter(sq: string, playerColor: string, cell: number): [number, number] | null {
+  const grid = displaySquares(playerColor);
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++)
+    if (grid[r][c] === sq) return [(c + 0.5) * cell, (r + 0.5) * cell];
+  return null;
+}
+
+function fmtEval(e: NEval | null): string {
+  if (!e) return "–";
+  if (e.type === "mate") return (e.white > 0 ? "M" : "-M") + Math.abs(e.white);
+  const p = e.white / 100;
+  return (p >= 0 ? "+" : "") + p.toFixed(1);
+}
+
+function whiteFrac(e: NEval | null): number {
+  if (!e) return 0.5;
+  if (e.type === "mate") return e.white > 0 ? 1 : 0;
+  const cp = Math.max(-1000, Math.min(1000, e.white));
+  return 0.5 + (cp / 1000) * 0.5;
+}
+
 /* ── data types & constants ── */
 interface Puzzle { id: string; fen: string; moves: string[]; rating: number; themes: string[]; popularity: number; }
 
@@ -176,7 +216,8 @@ function Piece({ pc, size }: { pc: string; size: number }) {
   const white = pc === pc.toUpperCase();
   return (
     <span style={{fontSize:size,lineHeight:1,userSelect:"none",display:"block",textAlign:"center",
-      color:white?"#f8f6ef":"#262320",WebkitTextStroke:white?"1.3px #6b5640":"1.3px #0b0b0b",
+      color:white?"#f8f6ef":"#2a2620",
+      WebkitTextStroke:white?"0.6px #7a6348":"0.6px #c8a368",
       textShadow:"0 1px 2px rgba(0,0,0,0.35)",pointerEvents:"none"}}>
       {GLYPH[pc.toLowerCase()]}
     </span>
@@ -219,6 +260,11 @@ export default function App() {
   const [flash, setFlash] = useState<"ok"|"no"|null>(null);
   const [score, setScore] = useState({ correct:0, wrong:0 });
   const [boardPx, setBoardPx] = useState(0);
+
+  // analysis
+  const [analyzeOn, setAnalyzeOn] = useState(false);
+  const [evalInfo, setEvalInfo] = useState<NEval|null>(null);
+  const [engineThinking, setEngineThinking] = useState(false);
 
   const boardRef = useRef<HTMLDivElement>(null);
   const pendingRef = useRef<{sq:string;x0:number;y0:number;moved:boolean;movable:boolean;piece:string;toggle:boolean}|null>(null);
@@ -331,6 +377,21 @@ export default function App() {
     ro.observe(boardRef.current);
     return ()=>ro.disconnect();
   },[screen]);
+
+  /* ── engine analysis: re-evaluate whenever the position changes ── */
+  useEffect(()=>{
+    if(!analyzeOn||screen!=="play"||!pos){ return; }
+    const turn=pos.turn;
+    setEngineThinking(true);
+    engine.analyze(posToFEN(pos),14,(info,done)=>{
+      setEvalInfo({ type:info.type, white:turn==="w"?info.value:-info.value, depth:info.depth, best:info.pv[0] });
+      if(done) setEngineThinking(false);
+    });
+  },[analyzeOn,pos,screen]);
+
+  useEffect(()=>{
+    if(!analyzeOn){ engine.stop(); setEvalInfo(null); setEngineThinking(false); }
+  },[analyzeOn]);
 
   /* ── interaction ── */
   const movable=(sq: string)=>{ const pc=pos?.board[sq]; return !!pc&&colorOf(pc)===playerColor&&playerTurn; };
@@ -550,7 +611,16 @@ export default function App() {
         </div>
       </div>
 
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
       <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",marginBottom:8}}>
+        {analyzeOn&&(
+          <span style={{display:"flex",alignItems:"center",gap:5,fontSize:13,fontWeight:800,fontVariantNumeric:"tabular-nums",
+            color:(evalInfo?.white??0)>=0?"#eef0f5":"#b9b9cc",background:"#15151f",border:`1px solid ${C.line}`,borderRadius:8,padding:"3px 9px"}}>
+            {engineThinking&&<Loader2 size={12} color={C.sub} style={{animation:"spin 1s linear infinite"}} />}
+            <span>{evalInfo?fmtEval(evalInfo):"분석 준비…"}</span>
+            {evalInfo&&<span style={{fontSize:10,color:C.sub,fontWeight:600}}>d{evalInfo.depth}</span>}
+          </span>
+        )}
         <span style={{fontSize:12,fontWeight:700,color:C.gold,background:"rgba(226,185,111,0.15)",border:`1px solid ${C.gold}55`,borderRadius:999,padding:"2px 9px"}}>
           레이팅 {puzzle.rating}
         </span>
@@ -560,7 +630,14 @@ export default function App() {
         ))}
       </div>
 
-      <div style={{padding:8,borderRadius:10,background:"linear-gradient(145deg,#3a3a52,#2a2a40)",outline:`3px solid ${frame}`,outlineOffset:1,transition:"outline-color .2s"}}>
+      <div style={{padding:8,borderRadius:10,background:"linear-gradient(145deg,#3a3a52,#2a2a40)",outline:`3px solid ${frame}`,outlineOffset:1,transition:"outline-color .2s",display:"flex",gap:8,alignItems:"stretch"}}>
+        {analyzeOn&&(
+          <div style={{width:16,flexShrink:0,borderRadius:4,overflow:"hidden",background:"#26233a",display:"flex",flexDirection:"column"}}>
+            <div style={{height:`${(1-whiteFrac(evalInfo))*100}%`,background:"#1e1b17",transition:"height .35s"}} />
+            <div style={{flex:1,background:"#f5f0dc"}} />
+          </div>
+        )}
+        <div style={{position:"relative",flex:1,minWidth:0}}>
         <div ref={boardRef} style={{width:"100%",aspectRatio:"1/1",display:"grid",gridTemplateColumns:"repeat(8,1fr)",gridTemplateRows:"repeat(8,1fr)",borderRadius:4,overflow:"hidden",touchAction:"none"}}>
           {grid.map((row,r)=>row.map((sq,c)=>{
             const piece=pos.board[sq],dark=isDark(sq);
@@ -584,6 +661,24 @@ export default function App() {
               </div>
             );
           }))}
+        </div>
+        {analyzeOn&&evalInfo?.best&&!busy&&(()=>{
+          const from=evalInfo.best.slice(0,2),to=evalInfo.best.slice(2,4);
+          const a=sqCenter(from,playerColor,cell),b=sqCenter(to,playerColor,cell);
+          if(!a||!b) return null;
+          const dx=b[0]-a[0],dy=b[1]-a[1],len=Math.hypot(dx,dy)||1,ux=dx/len,uy=dy/len;
+          const head=cell*0.42,ex=b[0]-ux*head*0.55,ey=b[1]-uy*head*0.55;
+          return (
+            <svg viewBox={`0 0 ${px} ${px}`} style={{position:"absolute",inset:0,width:"100%",height:"100%",pointerEvents:"none",zIndex:5}}>
+              <defs>
+                <marker id="arw" markerUnits="userSpaceOnUse" markerWidth={head} markerHeight={head} refX={head*0.5} refY={head*0.5} orient="auto">
+                  <path d={`M0,0 L${head},${head*0.5} L0,${head} L${head*0.28},${head*0.5} Z`} fill="#15803d" />
+                </marker>
+              </defs>
+              <line x1={a[0]} y1={a[1]} x2={ex} y2={ey} stroke="#15803d" strokeWidth={cell*0.16} strokeLinecap="round" markerEnd="url(#arw)" opacity="0.82" />
+            </svg>
+          );
+        })()}
         </div>
       </div>
 
@@ -614,6 +709,7 @@ export default function App() {
       <div style={{marginTop:12,display:"flex",flexWrap:"wrap",gap:8}}>
         <Btn onClick={hint} disabled={!playerTurn} Icon={Lightbulb} label={hintLvl===0?"힌트":"힌트 더보기"} />
         <Btn onClick={reveal} disabled={solved||failed||busy} Icon={Eye} label="정답 보기" />
+        <Btn onClick={()=>setAnalyzeOn(v=>!v)} Icon={Activity} label={analyzeOn?"분석 끄기":"분석"} primary={analyzeOn} />
       </div>
       <div style={{marginTop:8,display:"flex",alignItems:"center",gap:8}}>
         <Btn onClick={goBack} disabled={historyIdx<=0} Icon={ChevronLeft} label="이전" />
