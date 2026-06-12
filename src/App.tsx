@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect } from "react";
-import { Lightbulb, Eye, ChevronLeft, ChevronRight, Trophy, X, Loader2, ArrowLeft, Activity } from "lucide-react";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { Lightbulb, Eye, ChevronLeft, ChevronRight, SkipForward, Shuffle, Trophy, X, Loader2, ArrowLeft, Activity } from "lucide-react";
 import * as engine from "./engine";
 
 /* ─────────────────────────────────────────────────────────────
@@ -17,6 +17,7 @@ const uciToMove = (u: string) => ({ from: u.slice(0, 2), to: u.slice(2, 4), prom
 
 interface Pos { board: Record<string, string>; turn: string; castling: string; ep: string | null; }
 interface Move { from: string; to: string; promotion?: string; }
+interface Ply { pos: Pos; lastMove: { from: string; to: string } | null; }
 
 function parseFEN(fen: string): Pos {
   const [placement, turn, castling, ep] = fen.split(" ");
@@ -243,17 +244,17 @@ export default function App() {
 
   // play state
   const [puzzle, setPuzzle] = useState<Puzzle|null>(null);
-  const [pos, setPos] = useState<Pos|null>(null);
   const [playerColor, setPlayerColor] = useState("w");
   const [moves, setMoves] = useState<string[]>([]);
   const [next, setNext] = useState(0);
+  const [cursor, setCursor] = useState(0);          // displayed ply within the current line
+  const [branchLine, setBranchLine] = useState<Ply[]|null>(null); // free-exploration variation
   const [busy, setBusy] = useState(false);
   const [solved, setSolved] = useState(false);
   const [failed, setFailed] = useState(false);
   const [selected, setSelected] = useState<string|null>(null);
   const [dots, setDots] = useState<string[]>([]);
   const [dragging, setDragging] = useState<{from:string;piece:string;x:number;y:number}|null>(null);
-  const [lastMove, setLastMove] = useState<{from:string;to:string}|null>(null);
   const [hintSq, setHintSq] = useState<string[]|null>(null);
   const [hintLvl, setHintLvl] = useState(0);
   const [promo, setPromo] = useState<{from:string;to:string}|null>(null);
@@ -270,15 +271,35 @@ export default function App() {
   const pendingRef = useRef<{sq:string;x0:number;y0:number;moved:boolean;movable:boolean;piece:string;toggle:boolean}|null>(null);
   const apiRef = useRef<Record<string,Function>>({});
   const abortRef = useRef<AbortController|null>(null);
-  const historyRef = useRef<{ puzzles: Puzzle[]; idx: number }>({ puzzles: [], idx: -1 });
-  const [historyIdx, setHistoryIdx] = useState(-1);
 
   const px = boardPx||360, cell = px/8;
-  const grid = pos ? displaySquares(playerColor) : [];
-  const playerTurn = !busy&&!solved&&!failed&&next%2===1&&next<moves.length;
-  const expected = playerTurn ? moves[next] : null;
-  const expFrom = expected ? expected.slice(0,2) : null;
-  const expTo = expected ? expected.slice(2,4) : null;
+
+  // The mainline = the puzzle's actual move sequence, replayed up to the live frontier (next plies).
+  const mainLine = useMemo<Ply[]>(()=>{
+    if(!puzzle) return [];
+    const start = parseFEN(puzzle.fen);
+    const line: Ply[] = [{ pos: start, lastMove: null }];
+    let p = start;
+    for(let i=0;i<next;i++){
+      p = makeMove(p, uciToMove(moves[i]));
+      line.push({ pos: p, lastMove: { from: moves[i].slice(0,2), to: moves[i].slice(2,4) } });
+    }
+    return line;
+  },[puzzle, moves, next]);
+
+  // What we actually show: a free-exploration branch if one exists, otherwise the mainline.
+  const displayLine = branchLine ?? mainLine;
+  const cur = displayLine.length ? Math.min(Math.max(cursor,0), displayLine.length-1) : 0;
+  const viewEntry = displayLine[cur] ?? null;
+  const viewPos = viewEntry?.pos ?? null;
+  const viewLastMove = viewEntry?.lastMove ?? null;
+  const viewFen = viewPos ? posToFEN(viewPos) : null;
+
+  const atLive = !branchLine && cur === next;               // showing the live (solving) position
+  const reviewing = solved || failed || !atLive;            // anything else = review/explore
+  const grid = viewPos ? displaySquares(playerColor) : [];
+  const playerTurn = atLive && !busy && !solved && !failed && next%2===1 && next<moves.length;
+  const exploreMode = reviewing && !busy && !!viewPos;      // free play of any legal move
 
   const minMax = (): [number,number] => custom?[minR,maxR]:[myRating+WINDOWS[win][0],myRating+WINDOWS[win][1]];
 
@@ -322,54 +343,28 @@ export default function App() {
     }
 
     setPool(all); setDataReady(true); setScore({ correct:0, wrong:0 });
-    historyRef.current = { puzzles: [], idx: -1 };
-    setHistoryIdx(-1);
     startPuzzle(all);
   }
 
   /* ── puzzle lifecycle ── */
   function launchPuzzle(p: Puzzle) {
     const start = parseFEN(p.fen);
-    const solver = start.turn==="w"?"b":"w";
-    setPuzzle(p); setMoves(p.moves); setPlayerColor(solver);
-    setPos(start); setNext(0); setSolved(false); setFailed(false);
-    setSelected(null); setDots([]); setHintSq(null); setHintLvl(0); setPromo(null); setLastMove(null);
+    setPuzzle(p); setMoves(p.moves); setPlayerColor(start.turn==="w"?"b":"w");
+    setNext(0); setCursor(0); setBranchLine(null);
+    setSolved(false); setFailed(false);
+    setSelected(null); setDots([]); setHintSq(null); setHintLvl(0); setPromo(null);
     setBusy(true); setScreen("play");
-    setTimeout(()=>{
-      const after=makeMove(start,uciToMove(p.moves[0]));
-      setPos(after); setLastMove({from:p.moves[0].slice(0,2),to:p.moves[0].slice(2,4)});
-      setNext(1); setBusy(false);
-    },600);
+    setTimeout(()=>{ setNext(1); setCursor(1); setBusy(false); },600);  // auto-play opponent's setup move
   }
 
   function startPuzzle(list: Puzzle[]) {
-    const p = list[Math.floor(Math.random()*list.length)];
-    const h = historyRef.current;
-    h.puzzles = h.puzzles.slice(0, h.idx + 1);
-    h.puzzles.push(p);
-    h.idx = h.puzzles.length - 1;
-    setHistoryIdx(h.idx);
-    launchPuzzle(p);
+    launchPuzzle(list[Math.floor(Math.random()*list.length)]);
   }
 
-  function goBack() {
-    const h = historyRef.current;
-    if (h.idx <= 0) return;
-    h.idx--;
-    setHistoryIdx(h.idx);
-    launchPuzzle(h.puzzles[h.idx]);
-  }
-
-  function goForward() {
-    const h = historyRef.current;
-    if (h.idx < h.puzzles.length - 1) {
-      h.idx++;
-      setHistoryIdx(h.idx);
-      launchPuzzle(h.puzzles[h.idx]);
-    } else {
-      startPuzzle(pool);
-    }
-  }
+  /* ── within-puzzle review / free exploration ── */
+  const goPrev=()=>{ if(cur>0){ setSelected(null); setDots([]); setCursor(cur-1); } };
+  const goNext=()=>{ if(cur<displayLine.length-1){ setSelected(null); setDots([]); setCursor(cur+1); } };
+  const goLive=()=>{ setSelected(null); setDots([]); setBranchLine(null); setCursor(next); };
 
   useEffect(()=>{
     if (!boardRef.current) return;
@@ -378,25 +373,30 @@ export default function App() {
     return ()=>ro.disconnect();
   },[screen]);
 
-  /* ── engine analysis: re-evaluate whenever the position changes ── */
+  /* ── engine analysis: re-evaluate whenever the *viewed* position changes ── */
   useEffect(()=>{
-    if(!analyzeOn||screen!=="play"||!pos){ return; }
-    const turn=pos.turn;
+    if(!analyzeOn||screen!=="play"||!viewFen){ return; }
+    const turn=viewFen.split(" ")[1];
     setEngineThinking(true);
-    engine.analyze(posToFEN(pos),14,(info,done)=>{
+    engine.analyze(viewFen,14,(info,done)=>{
       setEvalInfo({ type:info.type, white:turn==="w"?info.value:-info.value, depth:info.depth, best:info.pv[0] });
       if(done) setEngineThinking(false);
     });
-  },[analyzeOn,pos,screen]);
+  },[analyzeOn,viewFen,screen]);
 
   useEffect(()=>{
     if(!analyzeOn){ engine.stop(); setEvalInfo(null); setEngineThinking(false); }
   },[analyzeOn]);
 
   /* ── interaction ── */
-  const movable=(sq: string)=>{ const pc=pos?.board[sq]; return !!pc&&colorOf(pc)===playerColor&&playerTurn; };
-  const acceptable=(sq: string)=>dots.includes(sq)||(selected===expFrom&&sq===expTo);
-  function select(sq: string){ setSelected(sq); setDots([...new Set(legalFrom(pos!,sq).map(m=>m.to))]); }
+  const movable=(sq: string)=>{
+    const pc=viewPos?.board[sq]; if(!pc) return false;
+    if(playerTurn) return colorOf(pc)===playerColor;
+    if(exploreMode) return colorOf(pc)===viewPos!.turn;
+    return false;
+  };
+  const acceptable=(sq: string)=>dots.includes(sq);
+  function select(sq: string){ setSelected(sq); setDots([...new Set(legalFrom(viewPos!,sq).map(m=>m.to))]); }
 
   function squareFromPoint(x: number,y: number): string|null {
     if(!boardRef.current) return null;
@@ -407,42 +407,54 @@ export default function App() {
   }
 
   function attemptMove(from: string,to: string,promoChoice?: string) {
-    if(!playerTurn) return;
-    const piece=pos!.board[from];
-    if(!piece||colorOf(piece)!==playerColor) return;
-    const last=playerColor==="w"?"8":"1";
-    const needs=piece.toLowerCase()==="p"&&to[1]===last;
+    if(!viewPos) return;
+    const solving=playerTurn;
+    const exploring=!solving&&exploreMode;
+    if(!solving&&!exploring) return;
+    const piece=viewPos.board[from];
+    if(!piece) return;
+    const color=colorOf(piece);
+    if(solving&&color!==playerColor) return;
+    if(exploring&&color!==viewPos.turn) return;
+    const lastRank=color==="w"?"8":"1";
+    const needs=piece.toLowerCase()==="p"&&to[1]===lastRank;
     if(needs&&!promoChoice){ setPromo({from,to}); return; }
-    const uci=from+to+(needs?promoChoice:"");
     setSelected(null); setDots([]);
-    if(uci.toLowerCase()===moves[next].toLowerCase()){
-      const np=makeMove(pos!,{from,to,promotion:needs?promoChoice:undefined});
-      setPos(np); setLastMove({from,to}); setHintSq(null); setHintLvl(0); setPromo(null);
-      setFlash("ok"); setTimeout(()=>setFlash(null),450);
-      const nn=next+1; setNext(nn);
-      if(nn>=moves.length){ setSolved(true); setScore(s=>({...s,correct:s.correct+1})); }
-      else {
-        setBusy(true);
-        setTimeout(()=>{
-          const op=makeMove(np,uciToMove(moves[nn]));
-          setPos(op); setLastMove({from:moves[nn].slice(0,2),to:moves[nn].slice(2,4)});
-          setNext(nn+1); setBusy(false);
-        },500);
+
+    if(solving){
+      const uci=from+to+(needs?promoChoice:"");
+      if(uci.toLowerCase()===moves[next].toLowerCase()){
+        setHintSq(null); setHintLvl(0); setPromo(null);
+        setFlash("ok"); setTimeout(()=>setFlash(null),450);
+        const nn=next+1; setNext(nn); setCursor(nn);
+        if(nn>=moves.length){ setSolved(true); setScore(s=>({...s,correct:s.correct+1})); }
+        else {
+          setBusy(true);
+          setTimeout(()=>{ setNext(nn+1); setCursor(nn+1); setBusy(false); },500);  // opponent replies
+        }
+      } else {
+        setPromo(null); setFlash("no"); setScore(s=>({...s,wrong:s.wrong+1}));
+        setTimeout(()=>setFlash(null),950);
       }
-    } else {
-      setPromo(null); setFlash("no"); setScore(s=>({...s,wrong:s.wrong+1}));
-      setTimeout(()=>setFlash(null),950);
+      return;
     }
+
+    // exploring: any legal move forks a free variation from the current view
+    if(!legalFrom(viewPos,from).some(m=>m.to===to)){ setPromo(null); return; }
+    const np=makeMove(viewPos,{from,to,promotion:needs?promoChoice:undefined});
+    const newLine=[...displayLine.slice(0,cur+1),{pos:np,lastMove:{from,to}}];
+    setBranchLine(newLine); setCursor(newLine.length-1); setPromo(null);
   }
 
   function handleClick(sq: string) {
-    if(!playerTurn){ setSelected(null); setDots([]); return; }
+    const myColor=playerTurn?playerColor:exploreMode?viewPos!.turn:null;
+    if(!myColor){ setSelected(null); setDots([]); return; }
     if(selected){
-      if(pos!.board[sq]&&colorOf(pos!.board[sq])===playerColor&&sq!==selected){ select(sq); return; }
+      if(viewPos!.board[sq]&&colorOf(viewPos!.board[sq])===myColor&&sq!==selected){ select(sq); return; }
       if(acceptable(sq)){ attemptMove(selected,sq); return; }
       setSelected(null); setDots([]); return;
     }
-    if(pos!.board[sq]&&colorOf(pos!.board[sq])===playerColor) select(sq);
+    if(viewPos!.board[sq]&&colorOf(viewPos!.board[sq])===myColor) select(sq);
   }
   apiRef.current={attemptMove,handleClick,squareFromPoint,acceptable,setSelected,setDots,setDragging};
 
@@ -470,7 +482,7 @@ export default function App() {
 
   function onDown(sq: string,e: React.PointerEvent) {
     const mv=movable(sq);
-    pendingRef.current={sq,x0:e.clientX,y0:e.clientY,moved:false,movable:mv,piece:pos!.board[sq],toggle:selected===sq};
+    pendingRef.current={sq,x0:e.clientX,y0:e.clientY,moved:false,movable:mv,piece:viewPos!.board[sq],toggle:selected===sq};
     if(mv&&selected!==sq) select(sq);
   }
 
@@ -483,16 +495,15 @@ export default function App() {
 
   function reveal() {
     if(solved||failed||busy) return;
-    setFailed(true); setBusy(true); setSelected(null); setDots([]); setHintSq(null);
+    setFailed(true); setBusy(true); setSelected(null); setDots([]); setHintSq(null); setHintLvl(0); setPromo(null); setBranchLine(null);
     setScore(s=>({...s,wrong:s.wrong+1}));
-    let i=next,p=pos!;
+    let i=next;
     const step=()=>{
-      if(i>=moves.length){ setBusy(false); setNext(i); return; }
-      p=makeMove(p,uciToMove(moves[i]));
-      setPos(p); setLastMove({from:moves[i].slice(0,2),to:moves[i].slice(2,4)});
-      i++; setTimeout(step,560);
+      if(i>=moves.length){ setBusy(false); return; }
+      i++; setNext(i); setCursor(i);   // reveal one ply at a time; mainLine derives the position
+      setTimeout(step,560);
     };
-    step();
+    setTimeout(step,300);
   }
 
   const toggleTheme=(k: string)=>setThemes(t=>t.includes(k)?t.filter(x=>x!==k):[...t,k]);
@@ -587,11 +598,13 @@ export default function App() {
   }
 
   // ── play ──
-  if (!pos||!puzzle) return null;
-  const frame=flash==="ok"?"#4caf50":flash==="no"?"#e05a52":solved?"#4caf50":"transparent";
+  if (!viewPos||!puzzle) return null;
+  const frame=flash==="ok"?"#4caf50":flash==="no"?"#e05a52":solved&&atLive?"#4caf50":"transparent";
   let status: string,sColor: string;
-  if(solved){ status="🎉 퍼즐 완료"; sColor="#ffd54f"; }
-  else if(failed){ status="정답 수순을 표시했습니다"; sColor="#f0807a"; }
+  if(branchLine){ status="분기 탐색 중 · ◀ 되돌리거나 ‘라이브로’"; sColor=C.gold; }
+  else if(!atLive){ status="복기 중 · ▶로 라이브 복귀 후 이어서"; sColor=C.sub; }
+  else if(solved){ status="🎉 퍼즐 완료 — 자유롭게 복기/탐색하세요"; sColor="#ffd54f"; }
+  else if(failed){ status="정답 수순 — 자유롭게 복기/탐색하세요"; sColor="#f0807a"; }
   else if(flash==="no"){ status="✗ 그 수가 아닙니다. 다시 시도하세요"; sColor="#f0807a"; }
   else if(busy){ status="상대가 두는 중…"; sColor=C.sub; }
   else if(playerTurn){ status=`${playerColor==="w"?"백":"흑"} 차례 — 최선의 수를 찾으세요`; sColor=C.txt; }
@@ -640,8 +653,8 @@ export default function App() {
         <div style={{position:"relative",flex:1,minWidth:0}}>
         <div ref={boardRef} style={{width:"100%",aspectRatio:"1/1",display:"grid",gridTemplateColumns:"repeat(8,1fr)",gridTemplateRows:"repeat(8,1fr)",borderRadius:4,overflow:"hidden",touchAction:"none"}}>
           {grid.map((row,r)=>row.map((sq,c)=>{
-            const piece=pos.board[sq],dark=isDark(sq);
-            const last=lastMove&&(lastMove.from===sq||lastMove.to===sq);
+            const piece=viewPos.board[sq],dark=isDark(sq);
+            const last=viewLastMove&&(viewLastMove.from===sq||viewLastMove.to===sq);
             const isSel=selected===sq,isDot=dots.includes(sq),isHint=hintSq&&hintSq.includes(sq);
             const hide=dragging&&dragging.from===sq;
             const lbl=dark?"#f0d9b5":"#b58863";
@@ -711,15 +724,18 @@ export default function App() {
         <Btn onClick={reveal} disabled={solved||failed||busy} Icon={Eye} label="정답 보기" />
         <Btn onClick={()=>setAnalyzeOn(v=>!v)} Icon={Activity} label={analyzeOn?"분석 끄기":"분석"} primary={analyzeOn} />
       </div>
-      <div style={{marginTop:8,display:"flex",alignItems:"center",gap:8}}>
-        <Btn onClick={goBack} disabled={historyIdx<=0} Icon={ChevronLeft} label="이전" />
-        <span style={{fontSize:12,color:C.sub,minWidth:48,textAlign:"center"}}>
-          {historyIdx+1} / {historyRef.current.puzzles.length}
+      <div style={{marginTop:8,display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+        <Btn onClick={goPrev} disabled={cur<=0} Icon={ChevronLeft} label="이전 수" />
+        <span style={{fontSize:12,color:C.sub,minWidth:78,textAlign:"center",fontVariantNumeric:"tabular-nums"}}>
+          수 {cur} / {displayLine.length-1}{branchLine?" · 분기":""}
         </span>
-        <Btn onClick={goForward} Icon={ChevronRight} label="다음 퍼즐" primary />
+        <Btn onClick={goNext} disabled={cur>=displayLine.length-1} Icon={ChevronRight} label="다음 수" />
+        <Btn onClick={goLive} disabled={atLive} Icon={SkipForward} label="라이브로" />
+        <div style={{flex:1}} />
+        <Btn onClick={()=>startPuzzle(pool)} Icon={Shuffle} label="다음 퍼즐" primary />
       </div>
-      <div style={{marginTop:8,fontSize:11.5,color:"#6f6f88"}}>
-        풀에 {pool.length.toLocaleString()}개 퍼즐 · 기물 드래그 또는 출발→도착 탭
+      <div style={{marginTop:8,fontSize:11.5,color:"#6f6f88",lineHeight:1.5}}>
+        풀에 {pool.length.toLocaleString()}개 퍼즐 · ◀▶로 한 수씩 복기 · {exploreMode?"지금 보드에서 다른 수를 직접 둬볼 수 있어요 (‘분석’ 켜면 평가 표시)":"기물 드래그 또는 출발→도착 탭"}
       </div>
     </div>
   );
