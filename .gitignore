@@ -26,3 +26,9 @@ dist-ssr
 # 로컬 테스트/검증 스크립트
 verify*.cjs
 *.png
+
+# PWA app icons are real assets, not test screenshots — keep them tracked
+!public/icon-192.png
+!public/icon-512.png
+!public/icon-512-maskable.png
+!public/apple-touch-icon.png
