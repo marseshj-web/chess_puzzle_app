@@ -155,6 +155,41 @@ function legalFrom(pos: Pos, sq: string): Move[] {
   });
 }
 
+/* ── SAN notation, derived purely from the positions before/after a move ── */
+function toSAN(before: Pos, mv: { from: string; to: string }, after: Pos): string {
+  const { from, to } = mv;
+  const piece = before.board[from];
+  if (!piece) return from + to;                              // defensive fallback
+  const type = piece.toLowerCase(), color = colorOf(piece);
+
+  if (type === "k" && Math.abs(to.charCodeAt(0) - from.charCodeAt(0)) === 2)
+    return to.charCodeAt(0) > from.charCodeAt(0) ? "O-O" : "O-O-O";
+
+  const captured = !!before.board[to] || (type === "p" && from[0] !== to[0]);   // incl. en passant
+  const promo = type === "p" && (to[1] === "8" || to[1] === "1")
+    ? "=" + (after.board[to] || "Q").toUpperCase() : "";
+
+  let core: string;
+  if (type === "p") {
+    core = (captured ? from[0] + "x" : "") + to + promo;
+  } else {
+    let file = false, rank = false, ambig = false;          // disambiguate among same-type movers
+    for (const sq in before.board) {
+      if (sq === from || before.board[sq] !== piece) continue;
+      if (legalFrom(before, sq).some(m => m.to === to)) {
+        ambig = true; if (sq[0] === from[0]) file = true; if (sq[1] === from[1]) rank = true;
+      }
+    }
+    const dis = !ambig ? "" : !file ? from[0] : !rank ? from[1] : from;
+    core = piece.toUpperCase() + dis + (captured ? "x" : "") + to;
+  }
+
+  const them = color === "w" ? "b" : "w", ks = findKing(after.board, them);
+  if (ks && isAttacked(after.board, ks, color))             // after.turn === them, so legalFrom finds their replies
+    core += Object.keys(after.board).some(sq => legalFrom(after, sq).length > 0) ? "+" : "#";
+  return core;
+}
+
 function displaySquares(pc: string): string[][] {
   const ranks=pc==="w"?[8,7,6,5,4,3,2,1]:[1,2,3,4,5,6,7,8];
   const files=pc==="w"?FILES:[...FILES].reverse();
@@ -268,6 +303,7 @@ export default function App() {
   const [engineThinking, setEngineThinking] = useState(false);
 
   const boardRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const pendingRef = useRef<{sq:string;x0:number;y0:number;moved:boolean;movable:boolean;piece:string;toggle:boolean}|null>(null);
   const apiRef = useRef<Record<string,Function>>({});
   const abortRef = useRef<AbortController|null>(null);
@@ -281,8 +317,9 @@ export default function App() {
     const line: Ply[] = [{ pos: start, lastMove: null }];
     let p = start;
     for(let i=0;i<next;i++){
-      p = makeMove(p, uciToMove(moves[i]));
-      line.push({ pos: p, lastMove: { from: moves[i].slice(0,2), to: moves[i].slice(2,4) } });
+      const m = uciToMove(moves[i]);
+      p = makeMove(p, m);
+      line.push({ pos: p, lastMove: { from: m.from, to: m.to } });
     }
     return line;
   },[puzzle, moves, next]);
@@ -296,10 +333,29 @@ export default function App() {
   const viewFen = viewPos ? posToFEN(viewPos) : null;
 
   const atLive = !branchLine && cur === next;               // showing the live (solving) position
-  const reviewing = solved || failed || !atLive;            // anything else = review/explore
   const grid = viewPos ? displaySquares(playerColor) : [];
   const playerTurn = atLive && !busy && !solved && !failed && next%2===1 && next<moves.length;
-  const exploreMode = reviewing && !busy && !!viewPos;      // free play of any legal move
+  const exploreMode = (solved||failed||!atLive) && !busy && !!viewPos;  // free play of any legal move
+  // Whose pieces may move now: solver's color while solving, side-to-move while exploring, else nobody.
+  const activeColor = playerTurn ? playerColor : exploreMode ? viewPos!.turn : null;
+
+  // SAN notation for the on-screen line, grouped into move-number rows for the review panel.
+  const sanList = useMemo<string[]>(()=>
+    displayLine.slice(1).map((ply,i)=>toSAN(displayLine[i].pos, ply.lastMove!, ply.pos)),
+  [displayLine]);
+  const moveRows = useMemo(()=>{
+    const baseNo = parseInt(puzzle?.fen.split(" ")[5]||"1",10) || 1;
+    const startTurn = displayLine[0]?.pos.turn ?? "w";
+    type Cell = { san: string; ply: number };
+    const rows: { no: number; white?: Cell; black?: Cell }[] = [];
+    sanList.forEach((san,i)=>{
+      const ply=i+1, h=ply-1+(startTurn==="w"?0:1), no=baseNo+Math.floor(h/2);
+      let row=rows.length&&rows[rows.length-1].no===no?rows[rows.length-1]:null;
+      if(!row){ row={no}; rows.push(row); }
+      if(h%2===0) row.white={san,ply}; else row.black={san,ply};
+    });
+    return rows;
+  },[sanList, displayLine, puzzle]);
 
   const minMax = (): [number,number] => custom?[minR,maxR]:[myRating+WINDOWS[win][0],myRating+WINDOWS[win][1]];
 
@@ -362,8 +418,9 @@ export default function App() {
   }
 
   /* ── within-puzzle review / free exploration ── */
-  const goPrev=()=>{ if(cur>0){ setSelected(null); setDots([]); setCursor(cur-1); } };
-  const goNext=()=>{ if(cur<displayLine.length-1){ setSelected(null); setDots([]); setCursor(cur+1); } };
+  const goTo=(i: number)=>{ if(i>=0&&i<displayLine.length){ setSelected(null); setDots([]); setCursor(i); } };
+  const goPrev=()=>goTo(cur-1);
+  const goNext=()=>goTo(cur+1);
   const goLive=()=>{ setSelected(null); setDots([]); setBranchLine(null); setCursor(next); };
 
   useEffect(()=>{
@@ -388,12 +445,15 @@ export default function App() {
     if(!analyzeOn){ engine.stop(); setEvalInfo(null); setEngineThinking(false); }
   },[analyzeOn]);
 
+  // keep the active move visible as the cursor walks the line
+  useEffect(()=>{
+    listRef.current?.querySelector<HTMLElement>('[data-active="1"]')?.scrollIntoView({block:"nearest"});
+  },[cur,displayLine.length]);
+
   /* ── interaction ── */
   const movable=(sq: string)=>{
-    const pc=viewPos?.board[sq]; if(!pc) return false;
-    if(playerTurn) return colorOf(pc)===playerColor;
-    if(exploreMode) return colorOf(pc)===viewPos!.turn;
-    return false;
+    const pc=viewPos?.board[sq];
+    return !!pc && !!activeColor && colorOf(pc)===activeColor;
   };
   const acceptable=(sq: string)=>dots.includes(sq);
   function select(sq: string){ setSelected(sq); setDots([...new Set(legalFrom(viewPos!,sq).map(m=>m.to))]); }
@@ -407,21 +467,15 @@ export default function App() {
   }
 
   function attemptMove(from: string,to: string,promoChoice?: string) {
-    if(!viewPos) return;
-    const solving=playerTurn;
-    const exploring=!solving&&exploreMode;
-    if(!solving&&!exploring) return;
+    if(!viewPos||!activeColor) return;
     const piece=viewPos.board[from];
-    if(!piece) return;
-    const color=colorOf(piece);
-    if(solving&&color!==playerColor) return;
-    if(exploring&&color!==viewPos.turn) return;
-    const lastRank=color==="w"?"8":"1";
+    if(!piece||colorOf(piece)!==activeColor) return;
+    const lastRank=activeColor==="w"?"8":"1";
     const needs=piece.toLowerCase()==="p"&&to[1]===lastRank;
     if(needs&&!promoChoice){ setPromo({from,to}); return; }
     setSelected(null); setDots([]);
 
-    if(solving){
+    if(playerTurn){
       const uci=from+to+(needs?promoChoice:"");
       if(uci.toLowerCase()===moves[next].toLowerCase()){
         setHintSq(null); setHintLvl(0); setPromo(null);
@@ -447,14 +501,13 @@ export default function App() {
   }
 
   function handleClick(sq: string) {
-    const myColor=playerTurn?playerColor:exploreMode?viewPos!.turn:null;
-    if(!myColor){ setSelected(null); setDots([]); return; }
+    if(!activeColor){ setSelected(null); setDots([]); return; }
     if(selected){
-      if(viewPos!.board[sq]&&colorOf(viewPos!.board[sq])===myColor&&sq!==selected){ select(sq); return; }
+      if(viewPos!.board[sq]&&colorOf(viewPos!.board[sq])===activeColor&&sq!==selected){ select(sq); return; }
       if(acceptable(sq)){ attemptMove(selected,sq); return; }
       setSelected(null); setDots([]); return;
     }
-    if(viewPos!.board[sq]&&colorOf(viewPos!.board[sq])===myColor) select(sq);
+    if(viewPos!.board[sq]&&colorOf(viewPos!.board[sq])===activeColor) select(sq);
   }
   apiRef.current={attemptMove,handleClick,squareFromPoint,acceptable,setSelected,setDots,setDragging};
 
@@ -734,10 +787,37 @@ export default function App() {
         <div style={{flex:1}} />
         <Btn onClick={()=>startPuzzle(pool)} Icon={Shuffle} label="다음 퍼즐" primary />
       </div>
+      {displayLine.length>1&&(
+        <div ref={listRef} style={{marginTop:8,background:C.card,border:`1px solid ${C.line}`,borderRadius:10,padding:"6px 8px",maxHeight:120,overflowY:"auto"}}>
+          <div style={{display:"grid",gridTemplateColumns:"auto 1fr 1fr",columnGap:4,rowGap:1,alignItems:"center",fontSize:13,fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"}}>
+            {moveRows.flatMap(row=>[
+              <span key={`n${row.no}`} style={{color:C.sub,textAlign:"right",paddingRight:2,userSelect:"none"}}>{row.no}.</span>,
+              row.white
+                ? <MoveChip key={`w${row.no}`} {...row.white} active={row.white.ply===cur} onClick={goTo} />
+                : <span key={`w${row.no}`} style={{color:C.sub,padding:"1px 6px"}}>…</span>,
+              row.black
+                ? <MoveChip key={`b${row.no}`} {...row.black} active={row.black.ply===cur} onClick={goTo} />
+                : <span key={`b${row.no}`} />,
+            ])}
+          </div>
+        </div>
+      )}
       <div style={{marginTop:8,fontSize:11.5,color:"#6f6f88",lineHeight:1.5}}>
-        풀에 {pool.length.toLocaleString()}개 퍼즐 · ◀▶로 한 수씩 복기 · {exploreMode?"지금 보드에서 다른 수를 직접 둬볼 수 있어요 (‘분석’ 켜면 평가 표시)":"기물 드래그 또는 출발→도착 탭"}
+        풀에 {pool.length.toLocaleString()}개 퍼즐 · ◀▶ 또는 기보 클릭으로 복기 · {exploreMode?"지금 보드에서 다른 수를 직접 둬볼 수 있어요 (‘분석’ 켜면 평가 표시)":"기물 드래그 또는 출발→도착 탭"}
       </div>
     </div>
+  );
+}
+
+function MoveChip({ san, ply, active, onClick }: {
+  san: string; ply: number; active: boolean; onClick: (i: number)=>void;
+}) {
+  return (
+    <button data-active={active?"1":undefined} onClick={()=>onClick(ply)}
+      style={{textAlign:"left",font:"inherit",border:"none",borderRadius:4,padding:"1px 6px",cursor:"pointer",
+        background:active?C.gold:"transparent",color:active?C.bg:C.txt,fontWeight:active?800:500}}>
+      {san}
+    </button>
   );
 }
 
